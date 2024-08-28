@@ -2,6 +2,7 @@
  * The MIT License (MIT)
  *
  * Copyright (c) 2019 Ha Thach (tinyusb.org)
+ * Copyright (c) 2024 Marek S. Łukasiewicz
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -51,6 +52,7 @@ static uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
 
 void led_blinking_task(void);
 void hid_task(void);
+void mouse_movement(int8_t *out_move_x, int8_t *out_move_y);
 
 /*------------- MAIN -------------*/
 int main(void) {
@@ -69,6 +71,68 @@ int main(void) {
 
         hid_task();
     }
+}
+
+int32_t mouse_pos_x = 0;
+int32_t mouse_pos_y = 0;
+int32_t target_pos_x = 0;
+int32_t target_pos_y = 0;
+
+const int32_t time_constant_ms = 500;
+uint32_t last_movement_ms = 0;
+void mouse_movement(int8_t *out_move_x, int8_t *out_move_y) {
+    uint32_t time_ms = board_millis();
+
+    // Only initialize on first call
+    if (last_movement_ms == 0) {
+        last_movement_ms = time_ms;
+        out_move_x = 0;
+        out_move_y = 0;
+        return;
+    }
+
+    // Move target every 2 seconds
+    uint8_t phase = (time_ms / 2000) % 4;
+    switch (phase) {
+    case 0:
+        target_pos_x = 200;
+        target_pos_y = -200;
+        break;
+
+    case 1:
+        target_pos_x = 200;
+        target_pos_y = 200;
+        break;
+
+    case 2:
+        target_pos_x = -200;
+        target_pos_y = 200;
+        break;
+
+    case 3:
+        target_pos_x = -200;
+        target_pos_y = -200;
+        break;
+
+    default:
+        target_pos_x = 0;
+        target_pos_y = 0;
+        break;
+    }
+
+    // First order filter (move to reach target after time constant)
+    int32_t delta_time_ms = time_ms - last_movement_ms;
+    if (delta_time_ms == 0) delta_time_ms = 1; // prevent division by 0
+    int32_t move_fraction = time_constant_ms / delta_time_ms;
+    if (move_fraction == 0) move_fraction = 1; // prevent division by 0
+
+    *out_move_x = (target_pos_x - mouse_pos_x) / move_fraction;
+    *out_move_y = (target_pos_y - mouse_pos_y) / move_fraction;
+    
+    // Update state
+    mouse_pos_x += *out_move_x;
+    mouse_pos_y += *out_move_y;
+    last_movement_ms = time_ms;
 }
 
 //--------------------------------------------------------------------+
@@ -98,91 +162,24 @@ void tud_resume_cb(void) {
 // USB HID
 //--------------------------------------------------------------------+
 
-static void send_hid_report(uint8_t report_id, uint32_t btn) {
+bool output_active = false;
+static void send_hid_report(uint32_t btn) {
     // skip if hid is not ready yet
     if (!tud_hid_ready())
         return;
 
-    switch (report_id) {
-    case REPORT_ID_KEYBOARD: {
-        // use to avoid send multiple consecutive zero report for keyboard
-        static bool has_keyboard_key = false;
+    if (btn)
+        output_active = true;
 
-        if (btn) {
-            uint8_t keycode[6] = {0};
-            keycode[0] = HID_KEY_A;
-
-            tud_hid_keyboard_report(REPORT_ID_KEYBOARD, 0, keycode);
-            has_keyboard_key = true;
-        } else {
-            // send empty key report if previously has key pressed
-            if (has_keyboard_key)
-                tud_hid_keyboard_report(REPORT_ID_KEYBOARD, 0, NULL);
-            has_keyboard_key = false;
-        }
-    } break;
-
-    case REPORT_ID_MOUSE: {
-        int8_t const delta = 5;
-
-        // no button, right + down, no scroll, no pan
-        tud_hid_mouse_report(REPORT_ID_MOUSE, 0x00, delta, delta, 0, 0);
-    } break;
-
-    case REPORT_ID_CONSUMER_CONTROL: {
-        // use to avoid send multiple consecutive zero report
-        static bool has_consumer_key = false;
-
-        if (btn) {
-            // volume down
-            uint16_t volume_down = HID_USAGE_CONSUMER_VOLUME_DECREMENT;
-            tud_hid_report(REPORT_ID_CONSUMER_CONTROL, &volume_down, 2);
-            has_consumer_key = true;
-        } else {
-            // send empty key report (release key) if previously has key pressed
-            uint16_t empty_key = 0;
-            if (has_consumer_key)
-                tud_hid_report(REPORT_ID_CONSUMER_CONTROL, &empty_key, 2);
-            has_consumer_key = false;
-        }
-    } break;
-
-    case REPORT_ID_GAMEPAD: {
-        // use to avoid send multiple consecutive zero report for keyboard
-        static bool has_gamepad_key = false;
-
-        hid_gamepad_report_t report = {.x = 0,
-                                       .y = 0,
-                                       .z = 0,
-                                       .rz = 0,
-                                       .rx = 0,
-                                       .ry = 0,
-                                       .hat = 0,
-                                       .buttons = 0};
-
-        if (btn) {
-            report.hat = GAMEPAD_HAT_UP;
-            report.buttons = GAMEPAD_BUTTON_A;
-            tud_hid_report(REPORT_ID_GAMEPAD, &report, sizeof(report));
-
-            has_gamepad_key = true;
-        } else {
-            report.hat = GAMEPAD_HAT_CENTERED;
-            report.buttons = 0;
-            if (has_gamepad_key)
-                tud_hid_report(REPORT_ID_GAMEPAD, &report, sizeof(report));
-            has_gamepad_key = false;
-        }
-    } break;
-
-    default:
-        break;
+    int8_t delta_x = 0, delta_y = 0;
+    if (output_active) {
+        mouse_movement(&delta_x, &delta_y);
     }
+
+    tud_hid_mouse_report(REPORT_ID_MOUSE, 0x00, delta_x, delta_y, 0, 0);
 }
 
-// Every 10ms, we will sent 1 report for each HID profile (keyboard, mouse etc
-// ..) tud_hid_report_complete_cb() is used to send the next report after
-// previous one is complete
+// Every 10ms, send mouse HID report
 void hid_task(void) {
     // Poll every 10ms
     const uint32_t interval_ms = 10;
@@ -200,9 +197,8 @@ void hid_task(void) {
         // and REMOTE_WAKEUP feature is enabled by host
         tud_remote_wakeup();
     } else {
-        // Send the 1st of report chain, the rest will be sent by
-        // tud_hid_report_complete_cb()
-        send_hid_report(REPORT_ID_KEYBOARD, btn);
+        // Send the report
+        send_hid_report(btn);
     }
 }
 
@@ -216,9 +212,9 @@ void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report,
 
     uint8_t next_report_id = report[0] + 1u;
 
-    if (next_report_id < REPORT_ID_COUNT) {
-        send_hid_report(next_report_id, board_button_read());
-    }
+    // if (next_report_id < REPORT_ID_COUNT) {
+    //     send_hid_report(board_button_read());
+    // }
 }
 
 // Invoked when received GET_REPORT control request
